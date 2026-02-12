@@ -8,16 +8,15 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, request, render_template_string
 
-# --- CONFIGURATION (Change these if you want) ---
+# --- DYNAMIC CONFIGURATION ---
 CONFIG = {
     "SYMBOL": "frxEURUSD",
-    "MIN_CYCLE": 60,
-    "MAX_CYCLE": 300,
-    "MIN_STRENGTH": 70,
-    "MAX_STRENGTH": 100,
-    "LOOKBACK_DAYS": 2
+    "MIN_CYCLE": 60,  # User Default: 60
+    "MAX_CYCLE": 60,  # User Default: 60
+    "MIN_STRENGTH": 57, # User Default: 57
+    "MAX_STRENGTH": 80  # User Default: 80
 }
 
 # --- GLOBAL STORAGE ---
@@ -26,10 +25,10 @@ LATEST_DATA = {
     "last_update": "Waiting...",
     "price": 0,
     "kings": [],
-    "settings": f"{CONFIG['MIN_CYCLE']}-{CONFIG['MAX_CYCLE']}s | {CONFIG['MIN_STRENGTH']}-{CONFIG['MAX_STRENGTH']}%"
+    "config": CONFIG
 }
 
-# --- 1. THE TRADING BOT ENGINE ---
+# --- TRADING BOT ENGINE ---
 class WallSpectrumLiveMonitor:
     def __init__(self, api_token):
         self.api_token = api_token
@@ -61,21 +60,26 @@ class WallSpectrumLiveMonitor:
         except: return []
 
     def backfill_data(self):
-        LATEST_DATA["status"] = "Backfilling Data..."
-        start_date = datetime.now(timezone.utc) - timedelta(days=CONFIG["LOOKBACK_DAYS"])
-        print(f"[SYSTEM] Backfilling from {start_date}...")
+        # --- NEW LOGIC: ALWAYS START FROM MONDAY 00:00 UTC ---
+        now_utc = datetime.now(timezone.utc)
+        # Calculate days since Monday (Monday=0, Sunday=6)
+        days_since_monday = now_utc.weekday()
+        # Subtract those days and reset time to 00:00:00
+        monday_start = (now_utc - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
         
-        now = int(datetime.now(timezone.utc).timestamp())
-        req_start = int(start_date.timestamp())
+        LATEST_DATA["status"] = f"Backfilling from Monday ({monday_start.strftime('%d %b')})..."
+        print(f"[SYSTEM] Backfilling history from: {monday_start}")
+        
+        now_ts = int(now_utc.timestamp())
+        req_start = int(monday_start.timestamp())
         
         tasks = []
         curr = req_start
-        while curr < now:
-            end = min(now, curr + 600)
+        while curr < now_ts:
+            end = min(now_ts, curr + 600)
             tasks.append((curr, end))
             curr = end
 
-        # Download in parallel (Fast)
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(self.fetch_ticks_chunk, t): t for t in tasks}
             for future in as_completed(futures):
@@ -106,10 +110,13 @@ class WallSpectrumLiveMonitor:
     def analyze_logic(self):
         try:
             streak_kings = {}
+            # Analyze ONLY the data we have backfilled (Since Monday)
             now_ts = int(time.time())
-            start_ts = now_ts - (4 * 3600) 
+            # Start analysis from 4 hours ago (Rolling window) or just analyze everything if needed
+            # For speed, we usually keep analysis window smaller, but let's do 24h
+            start_ts = now_ts - (24 * 3600) 
             
-            for cycle in range(CONFIG["MIN_CYCLE"], CONFIG["MAX_CYCLE"] + 1):
+            for cycle in range(int(CONFIG["MIN_CYCLE"]), int(CONFIG["MAX_CYCLE"]) + 1):
                 for offset in range(cycle):
                     query = f"""
                         SELECT 
@@ -165,7 +172,7 @@ class WallSpectrumLiveMonitor:
                             if count == 0: continue
                             strength = (1 - (nxt/count)) * 100
                             
-                            if CONFIG["MIN_STRENGTH"] <= strength <= CONFIG["MAX_STRENGTH"]:
+                            if float(CONFIG["MIN_STRENGTH"]) <= strength <= float(CONFIG["MAX_STRENGTH"]):
                                 key = (col_name, length)
                                 if key not in streak_kings or strength > streak_kings[key]['strength']:
                                     streak_kings[key] = {
@@ -189,25 +196,28 @@ class WallSpectrumLiveMonitor:
             kings = self.analyze_logic()
             LATEST_DATA["last_update"] = datetime.now().strftime("%H:%M:%S UTC")
             LATEST_DATA["kings"] = kings
-            time.sleep(30) # Refresh analysis every 30s
+            LATEST_DATA["config"] = CONFIG
+            time.sleep(10)
 
-# --- 2. WEB DASHBOARD ---
+# --- WEB DASHBOARD ---
 app = Flask(__name__)
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WallSpectrum Live</title>
+    <title>WallSpectrum Pro</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { background-color: #0d1117; color: #c9d1d9; font-family: monospace; margin: 0; padding: 10px; }
-        .header { border-bottom: 1px solid #30363d; padding-bottom: 10px; margin-bottom: 10px; }
-        .top-row { display: flex; justify-content: space-between; align-items: center; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363d; padding-bottom: 10px; margin-bottom: 10px; }
         .price { font-size: 1.4em; font-weight: bold; color: #58a6ff; }
-        .settings { font-size: 0.75em; color: #8b949e; margin-top: 5px; }
-        .status-dot { height: 10px; width: 10px; background-color: #3fb950; border-radius: 50%; display: inline-block; margin-right: 5px; }
-        .status-warn { background-color: #d29922; }
+        .gear-btn { font-size: 1.5em; cursor: pointer; user-select: none; }
+        .settings-panel { display: none; background: #161b22; padding: 15px; border: 1px solid #30363d; margin-bottom: 15px; border-radius: 6px; }
+        .input-group { margin-bottom: 10px; }
+        label { display: block; color: #8b949e; font-size: 0.8em; margin-bottom: 5px; }
+        input { background: #0d1117; border: 1px solid #30363d; color: white; padding: 5px; width: 60px; font-family: monospace; }
+        button { background: #238636; color: white; border: none; padding: 8px 15px; font-family: monospace; cursor: pointer; width: 100%; border-radius: 4px; }
         
         table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
         th { text-align: left; color: #8b949e; border-bottom: 1px solid #30363d; padding: 5px; }
@@ -219,40 +229,78 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="header">
-        <div class="top-row">
-            <div>
-                <span id="status-icon" class="status-dot status-warn"></span>
-                <span id="sys-status">Connecting...</span>
-            </div>
+        <div>
+            <div>WALLSPECTRUM <span style="color:red">PRO</span></div>
+            <div style="font-size:0.7em; color:#8b949e" id="status">Connecting...</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:15px;">
             <div class="price" id="price">---</div>
+            <div class="gear-btn" onclick="toggleSettings()">⚙️</div>
         </div>
-        <div class="settings">
-            SETTINGS: <span id="settings-text">...</span> <br>
-            UPDATED: <span id="last-update">...</span>
+    </div>
+
+    <div id="settings-panel" class="settings-panel">
+        <div style="display:flex; gap:10px;">
+            <div class="input-group">
+                <label>Min Cyc</label><input type="number" id="min_c">
+            </div>
+            <div class="input-group">
+                <label>Max Cyc</label><input type="number" id="max_c">
+            </div>
         </div>
+        <div style="display:flex; gap:10px;">
+            <div class="input-group">
+                <label>Min %</label><input type="number" id="min_s">
+            </div>
+            <div class="input-group">
+                <label>Max %</label><input type="number" id="max_s">
+            </div>
+        </div>
+        <button onclick="saveSettings()">APPLY SETTINGS</button>
     </div>
 
     <div id="content">Loading Data...</div>
 
     <script>
+        function toggleSettings() {
+            let p = document.getElementById('settings-panel');
+            p.style.display = p.style.display === 'block' ? 'none' : 'block';
+        }
+
+        async function saveSettings() {
+            let data = {
+                min_c: document.getElementById('min_c').value,
+                max_c: document.getElementById('max_c').value,
+                min_s: document.getElementById('min_s').value,
+                max_s: document.getElementById('max_s').value
+            };
+            await fetch('/update_config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            toggleSettings();
+            alert("Settings Updated!");
+        }
+
         async function refresh() {
             try {
                 let res = await fetch('/json');
                 let data = await res.json();
                 
                 document.getElementById('price').innerText = data.price;
-                document.getElementById('sys-status').innerText = data.status;
-                document.getElementById('last-update').innerText = data.last_update;
-                document.getElementById('settings-text').innerText = data.settings;
+                document.getElementById('status').innerText = data.status;
                 
-                let dot = document.getElementById('status-icon');
-                if(data.status.includes("Active")) dot.className = "status-dot";
-                else dot.className = "status-dot status-warn";
+                if(!document.getElementById('min_c').value && data.config) {
+                    document.getElementById('min_c').value = data.config.MIN_CYCLE;
+                    document.getElementById('max_c').value = data.config.MAX_CYCLE;
+                    document.getElementById('min_s').value = data.config.MIN_STRENGTH;
+                    document.getElementById('max_s').value = data.config.MAX_STRENGTH;
+                }
 
                 let html = '<table><thead><tr><th>TF</th><th>Lvl</th><th>%</th><th>Ratio</th></tr></thead><tbody>';
-                
                 if (data.kings.length === 0) {
-                    html += '<tr><td colspan="4" style="text-align:center; padding:20px;">No Walls Found (or Loading History...)</td></tr>';
+                    html += '<tr><td colspan="4" style="text-align:center; padding:20px;">No Walls Found</td></tr>';
                 } else {
                     data.kings.forEach(k => {
                         let c = k.color === 'Red' ? 'red-row' : 'green-row';
@@ -284,6 +332,16 @@ def dashboard(): return render_template_string(HTML_TEMPLATE)
 
 @app.route('/json')
 def get_json(): return jsonify(LATEST_DATA)
+
+@app.route('/update_config', methods=['POST'])
+def update_config():
+    data = request.json
+    CONFIG["MIN_CYCLE"] = int(data['min_c'])
+    CONFIG["MAX_CYCLE"] = int(data['max_c'])
+    CONFIG["MIN_STRENGTH"] = float(data['min_s'])
+    CONFIG["MAX_STRENGTH"] = float(data['max_s'])
+    LATEST_DATA["config"] = CONFIG
+    return jsonify({"status": "ok"})
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
